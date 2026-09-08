@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "vk_decoder_global_state.h"
+#include "renderpass2_dispatch.h"
+#include "dynamic_state_dispatch.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -31,6 +33,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <functional>
 #include <list>
 #include <memory>
@@ -2440,6 +2443,15 @@ class VkDecoderGlobalState::Impl {
 
         VulkanDispatch* dispatch = dispatch_VkDevice(boxedDevice);
         init_vulkan_dispatch_from_device(vk, *pDevice, dispatch);
+        initRenderPass2Dispatch(dispatch);
+        const auto extensionEnabled = [&](const char* name) {
+            return std::find(deviceInfo.enabledExtensionNames.begin(),
+                             deviceInfo.enabledExtensionNames.end(), name) !=
+                   deviceInfo.enabledExtensionNames.end();
+        };
+        initDynamicStateDispatch(
+            dispatch, extensionEnabled(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME),
+            extensionEnabled(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME));
 
         if (mLogging) {
             GFXSTREAM_INFO("%s: init vulkan dispatch from device (end)", __func__);
@@ -12890,3 +12902,20 @@ LIST_TRANSFORMED_TYPES(DEFINE_TRANSFORMED_TYPE_IMPL)
 }  // namespace vk
 }  // namespace host
 }  // namespace gfxstream
+
+namespace gfxstream::host::vk {
+void logMissingRenderPass2Create() {
+    GFXSTREAM_ERROR("Host exposes neither vkCreateRenderPass2 nor vkCreateRenderPass2KHR");
+}
+[[noreturn]] void missingRenderPass2Command(const char* name) {
+    GFXSTREAM_FATAL("Host renderpass2 command unavailable: %s", name);
+    std::abort();
+}
+}  // namespace gfxstream::host::vk
+
+namespace gfxstream::host::vk {
+[[noreturn]] void missingDynamicStateCommand(const char* name) {
+    GFXSTREAM_FATAL("Host promoted dynamic-state command unavailable: %s", name);
+    std::abort();
+}
+}  // namespace gfxstream::host::vk
