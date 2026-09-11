@@ -3452,13 +3452,19 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
         return false;
     }
 
-    // Avoid transitioning from VK_IMAGE_LAYOUT_UNDEFINED. Unfortunetly, Android does not
+    // Avoid transitioning from VK_IMAGE_LAYOUT_UNDEFINED. Unfortunately, Android does not
     // yet have a mechanism for sharing the expected VkImageLayout. However, the Vulkan
     // spec's image layout transition sections says "If the old layout is
     // VK_IMAGE_LAYOUT_UNDEFINED, the contents of that range may be discarded." Some
     // Vulkan drivers have been observed to actually perform the discard which leads to
     // ColorBuffer-s being unintentionally cleared. See go/ahb-vkimagelayout for a more
     // thorough write up.
+    const VkImageLayout originalLayout = colorBufferInfo->currentLayout;
+    const uint32_t originalQueueFamily = colorBufferInfo->currentQueueFamilyIndex;
+    const bool needsQueueTransfer =
+        originalQueueFamily != VK_QUEUE_FAMILY_IGNORED &&
+        originalQueueFamily != mQueueFamilyIndex;
+
     if (colorBufferInfo->currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
         colorBufferInfo->currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
@@ -3482,12 +3488,16 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
     const VkImageMemoryBarrier toTransferSrcImageBarrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .srcAccessMask = static_cast<VkAccessFlags>(
+            needsQueueTransfer ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+                               : VK_ACCESS_MEMORY_WRITE_BIT),
         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
         .oldLayout = currentLayout,
         .newLayout = transferSrcLayout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .srcQueueFamilyIndex = needsQueueTransfer ? originalQueueFamily
+                                                   : VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = needsQueueTransfer ? mQueueFamilyIndex
+                                                   : VK_QUEUE_FAMILY_IGNORED,
         .image = colorBufferInfo->image,
         .subresourceRange =
             {
@@ -3507,8 +3517,39 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
                                transferSrcLayout, mStaging.mBuffer,
                                bufferImageCopies.size(), bufferImageCopies.data());
 
-    // Change back to original layout
-    if (currentLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
+    // Change back to the original layout and ownership.  A ColorBuffer that
+    // was presented to the guest is owned by VK_QUEUE_FAMILY_EXTERNAL; the
+    // readback queue must acquire it before the copy and release it again so
+    // the next guest submission can use the image normally.
+    const VkImageLayout restoredLayout =
+        originalLayout == VK_IMAGE_LAYOUT_UNDEFINED ? transferSrcLayout : originalLayout;
+    if (needsQueueTransfer) {
+        const VkImageMemoryBarrier releaseQueueOwnership = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = static_cast<VkAccessFlags>(VK_ACCESS_MEMORY_READ_BIT |
+                                                        VK_ACCESS_MEMORY_WRITE_BIT),
+            .oldLayout = transferSrcLayout,
+            .newLayout = restoredLayout,
+            .srcQueueFamilyIndex = mQueueFamilyIndex,
+            .dstQueueFamilyIndex = originalQueueFamily,
+            .image = colorBufferInfo->image,
+            .subresourceRange =
+                {
+                    .aspectMask = aspectMask,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &releaseQueueOwnership);
+        colorBufferInfo->currentQueueFamilyIndex = originalQueueFamily;
+        colorBufferInfo->currentLayout = restoredLayout;
+    } else if (originalLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
         // Transfer back to original layout.
         const VkImageMemoryBarrier toCurrentLayoutImageBarrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3516,7 +3557,7 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
             .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
             .dstAccessMask = VK_ACCESS_NONE_KHR,
             .oldLayout = transferSrcLayout,
-            .newLayout = colorBufferInfo->currentLayout,
+            .newLayout = restoredLayout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = colorBufferInfo->image,

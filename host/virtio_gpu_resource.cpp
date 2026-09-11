@@ -198,6 +198,23 @@ std::optional<VirtioGpuResource> VirtioGpuResource::Create(
 
     resource.AttachIov(iov, num_iovs);
 
+    // CREATE_3D color buffers are host-only resources and therefore arrive
+    // without guest iovecs.  TransferRead still needs a linear staging area
+    // before it can copy the rendered ColorBuffer into the VMM's scanout
+    // iovec.  Leaving mLinear empty makes ReadFromColorBufferToLinear reject
+    // every readback, so a surfaceless display would publish its zero/old
+    // backing instead of the rendered frame.
+    if (resourceType == VirtioGpuResourceType::COLOR_BUFFER &&
+        resource.mLinear.empty()) {
+        const size_t linearSize = GetTransferSize(args->format, args->width, args->height,
+                                                  0, 0, args->width, args->height);
+        if (linearSize == 0) {
+            GFXSTREAM_ERROR("Failed to allocate transfer staging for resource %u", args->handle);
+            return std::nullopt;
+        }
+        resource.mLinear.resize(linearSize, 0);
+    }
+
     return resource;
 }
 
