@@ -218,7 +218,14 @@ std::optional<VirtioGpuResource> VirtioGpuResource::Create(
             return std::nullopt;
         }
 
-        auto resourceOpt = Create(createArgs, nullptr, 0);
+        // CREATE_3D is sent as a pending blob command before the virtio blob
+        // receives its final resource handle. FrameBuffer registers the
+        // ColorBuffer under args->handle, so bind that handle before creating
+        // it; leaving the decoded zero value registers an unreachable
+        // ColorBuffer: subsequent native-buffer imports use resourceId.
+        auto createArgsWithHandle = *createArgs;
+        createArgsWithHandle.handle = resourceId;
+        auto resourceOpt = Create(&createArgsWithHandle, nullptr, 0);
         if (!resourceOpt) {
             return std::nullopt;
         }
