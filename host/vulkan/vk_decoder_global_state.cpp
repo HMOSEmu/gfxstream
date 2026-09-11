@@ -8773,6 +8773,75 @@ class VkDecoderGlobalState::Impl {
                                     const VkAllocationCallbacks*, VkRenderPass* pRenderPass) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
+
+        // A device dispatch table is normally initialized immediately after
+        // vkCreateDevice.  Keep this entry point defensive because a stale
+        // boxed handle (or a device created before the dispatch table was
+        // populated) must not turn a malformed guest command into an indirect
+        // call through address zero.  The core and KHR commands have the same
+        // ABI after VK_KHR_create_renderpass2 promotion, so use the KHR entry
+        // as a fallback when a loader exposes only that spelling.
+        PFN_vkCreateRenderPass2 createRenderPass2 = nullptr;
+        if (vk != nullptr) {
+            createRenderPass2 = vk->vkCreateRenderPass2;
+            if (createRenderPass2 == nullptr && vk->vkCreateRenderPass2KHR != nullptr) {
+                createRenderPass2 = reinterpret_cast<PFN_vkCreateRenderPass2>(
+                    vk->vkCreateRenderPass2KHR);
+            }
+        }
+        if (device == VK_NULL_HANDLE || createRenderPass2 == nullptr) {
+            GFXSTREAM_WARNING("vkCreateRenderPass2 dispatch is unavailable");
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
+        /*
+         * A malformed guest packet must not be allowed to turn into a host
+         * pointer walk.  In particular, the generated decoder can hand us a
+         * structure whose sType/counts are garbage when a guest command is
+         * truncated or an older guest emits an incompatible packet.  The
+         * layout-adjustment path below dereferences every array from those
+         * counts, so validate the complete shallow shape before touching it.
+         */
+        const auto is_invalid_pointer = [](const void* ptr) {
+            return ptr != nullptr && reinterpret_cast<uintptr_t>(ptr) < 0x10000;
+        };
+        if (pCreateInfo == nullptr ||
+            pCreateInfo->sType != VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2 ||
+            pCreateInfo->attachmentCount > 4096 ||
+            pCreateInfo->subpassCount > 4096 ||
+            pCreateInfo->dependencyCount > 4096 ||
+            pCreateInfo->correlatedViewMaskCount > 4096 ||
+            (pCreateInfo->attachmentCount && pCreateInfo->pAttachments == nullptr) ||
+            (pCreateInfo->subpassCount && pCreateInfo->pSubpasses == nullptr) ||
+            (pCreateInfo->dependencyCount && pCreateInfo->pDependencies == nullptr) ||
+            (pCreateInfo->correlatedViewMaskCount && pCreateInfo->pCorrelatedViewMasks == nullptr) ||
+            is_invalid_pointer(pCreateInfo->pNext) ||
+            is_invalid_pointer(pCreateInfo->pAttachments) ||
+            is_invalid_pointer(pCreateInfo->pSubpasses) ||
+            is_invalid_pointer(pCreateInfo->pDependencies) ||
+            is_invalid_pointer(pCreateInfo->pCorrelatedViewMasks)) {
+            GFXSTREAM_WARNING("rejecting malformed VkRenderPassCreateInfo2");
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        for (uint32_t i = 0; i < pCreateInfo->subpassCount; ++i) {
+            const VkSubpassDescription2& subpass = pCreateInfo->pSubpasses[i];
+            if (subpass.sType != VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2 ||
+                subpass.inputAttachmentCount > 4096 ||
+                subpass.colorAttachmentCount > 4096 ||
+                subpass.preserveAttachmentCount > 4096 ||
+                (subpass.inputAttachmentCount && subpass.pInputAttachments == nullptr) ||
+                (subpass.colorAttachmentCount && subpass.pColorAttachments == nullptr) ||
+                (subpass.preserveAttachmentCount && subpass.pPreserveAttachments == nullptr) ||
+                is_invalid_pointer(subpass.pNext) ||
+                is_invalid_pointer(subpass.pInputAttachments) ||
+                is_invalid_pointer(subpass.pColorAttachments) ||
+                is_invalid_pointer(subpass.pResolveAttachments) ||
+                is_invalid_pointer(subpass.pPreserveAttachments) ||
+                is_invalid_pointer(subpass.pDepthStencilAttachment)) {
+                GFXSTREAM_WARNING("rejecting malformed VkSubpassDescription2");
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
         VkRenderPassCreateInfo2 createInfo;
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -8833,7 +8902,7 @@ class VkDecoderGlobalState::Impl {
             pCreateInfo = &createInfo;
         }
 
-        VkResult res = vk->vkCreateRenderPass2(device, pCreateInfo, nullptr, pRenderPass);
+        VkResult res = createRenderPass2(device, pCreateInfo, nullptr, pRenderPass);
         if (res != VK_SUCCESS) {
             return res;
         }
