@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "vk_decoder_global_state.h"
+#include "maintenance4_dispatch.h"
 #include "renderpass2_dispatch.h"
 #include "dynamic_state_dispatch.h"
 
@@ -2443,6 +2444,7 @@ class VkDecoderGlobalState::Impl {
 
         VulkanDispatch* dispatch = dispatch_VkDevice(boxedDevice);
         init_vulkan_dispatch_from_device(vk, *pDevice, dispatch);
+        initMaintenance4Dispatch(dispatch);
         initRenderPass2Dispatch(dispatch);
         const auto extensionEnabled = [&](const char* name) {
             return std::find(deviceInfo.enabledExtensionNames.begin(),
