@@ -658,6 +658,15 @@ int VirtioGpuResource::ReadFromColorBufferToLinear(uint64_t offset, stream_rende
         return -EINVAL;
     }
 
+    // A native-image ColorBuffer is not safe to expose to scanout until its
+    // guest vkQueueSignalReleaseImageANDROID() submission has completed. The
+    // virtio command path is asynchronous with the Vulkan decoder, so return
+    // EAGAIN and let QEMU retry on a later AIO turn instead of reading an
+    // in-flight or newly allocated image.
+    if (!FrameBuffer::getFB()->isColorBufferReadyForReadback(mCreateArgs->handle)) {
+        return -EAGAIN;
+    }
+
     auto formatOpt = ToGfxstreamFormat(mCreateArgs->format);
     if (!formatOpt) {
         GFXSTREAM_ERROR("Failed to transfer: unsupported format %d", mCreateArgs->format);
@@ -682,6 +691,25 @@ int VirtioGpuResource::ReadFromColorBufferToLinear(uint64_t offset, stream_rende
         FrameBuffer::getFB()->readColorBuffer(mCreateArgs->handle, 0, 0, mCreateArgs->width,
                                               mCreateArgs->height, format, mLinear.data(),
                                               mLinear.size());
+    }
+
+    static int diagReadCount = 0;
+    if (diagReadCount++ < 1000 && !mLinear.empty()) {
+        const size_t pixelBytes = 4;
+        const size_t center = (static_cast<size_t>(mCreateArgs->height) / 2 *
+                               mCreateArgs->width + mCreateArgs->width / 2) * pixelBytes;
+        const size_t last = (static_cast<size_t>(mCreateArgs->width) * mCreateArgs->height - 1) *
+                            pixelBytes;
+        auto byteAt = [this](size_t index) -> uint8_t {
+            return index < mLinear.size() ? mLinear[index] : 0;
+        };
+        GFXSTREAM_ERROR(
+            "[readback-diag] resource=%d cb=%u size=%zu first=%02x %02x %02x %02x "
+            "center=%02x %02x %02x %02x last=%02x %02x %02x %02x",
+            mId, mCreateArgs->handle, mLinear.size(), byteAt(0), byteAt(1), byteAt(2),
+            byteAt(3), byteAt(center), byteAt(center + 1), byteAt(center + 2),
+            byteAt(center + 3), byteAt(last), byteAt(last + 1), byteAt(last + 2),
+            byteAt(last + 3));
     }
 
     return 0;

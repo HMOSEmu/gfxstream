@@ -84,3 +84,11 @@ For symbolization, use the exact preserved artifact and `llvm-addr2line -f -C
 -i -e LIB OFFSET`. GNU addr2line stalled on these large debug artifacts in this
 workspace. The system coredumps were truncated; their crash register and mapping
 notes still identify the null indirect call sites.
+
+## Host query reset (2026-09-28)
+
+Run `bash tests/host-query-reset/run.sh`. API 1.1 + enabled
+`VK_EXT_host_query_reset` can expose only `vkResetQueryPoolEXT` on the host.
+The decoder's promoted core slot must resolve this enabled alias. The test
+checks extension gating, preserving a core pointer, forwarded query range,
+and unavailable entry points. It does not enable the hostQueryReset feature.

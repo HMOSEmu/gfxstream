@@ -430,6 +430,7 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
     bool flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes,
                                      size_t bytesSize);
     bool invalidateColorBufferForVk(HandleType colorBufferHandle);
+    bool isColorBufferReadyForReadback(HandleType colorBufferHandle);
 
     std::optional<BlobDescriptorInfo> exportColorBuffer(HandleType colorBufferHandle);
     std::optional<BlobDescriptorInfo> exportBuffer(HandleType bufferHandle);

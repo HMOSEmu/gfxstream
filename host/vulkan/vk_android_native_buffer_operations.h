@@ -74,6 +74,7 @@ class AndroidNativeBufferInfo {
     VkResult on_vkQueueSignalReleaseImageANDROID(VkEmulation* emu, VulkanDispatch* vk,
                                                  uint32_t queueFamilyIndex, VkQueue queue,
                                                  std::mutex* queueMutex,
+                                                 VkImageLayout imageLayout,
                                                  uint32_t waitSemaphoreCount,
                                                  const VkSemaphore* pWaitSemaphores,
                                                  int* pNativeFenceFd);

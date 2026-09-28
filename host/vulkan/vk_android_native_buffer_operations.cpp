@@ -137,6 +137,14 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
         return nullptr;
     }
 
+    static int anbCreateDiagCount = 0;
+    if (anbCreateDiagCount++ < 1000) {
+        VK_ANB_ERR("[anb-create-diag] cb=%u gl=%d external=%d guestVulkanOnly=%d format=%s extent=%ux%u",
+                   out->mColorBufferHandle, colorBufferExportedToGl,
+                   externalMemoryCompatible, emu && emu->isGuestVulkanOnly(),
+                   string_VkFormat(out->mVkFormat), out->mExtent.width, out->mExtent.height);
+    }
+
     if (externalMemoryCompatible) {
         emu->releaseColorBufferForGuestUse(out->mColorBufferHandle);
         out->mExternallyBacked = true;
@@ -172,6 +180,24 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             return nullptr;
         }
         const auto& importedColorBufferInfo = *importedColorBufferInfoOpt;
+        if (anbCreateDiagCount <= 1000) {
+            VK_ANB_ERR("[anb-host-cb-diag] cb=%u image=%p memory=%p size=%llu bindOffset=%llu dedicated=%d layout=%s qfam=%u",
+                       importedColorBufferHandle, importedColorBufferInfo.image,
+                       importedColorBufferInfo.memory.memory,
+                       static_cast<unsigned long long>(importedColorBufferInfo.memory.size),
+                       static_cast<unsigned long long>(importedColorBufferInfo.memory.bindOffset),
+                       importedColorBufferInfo.memory.dedicatedAllocation,
+                       string_VkImageLayout(importedColorBufferInfo.currentLayout),
+                       importedColorBufferInfo.currentQueueFamilyIndex);
+            if (anbCreateDiagCount <= 1000) {
+                VK_ANB_ERR("[anb-external-type-diag] cb=%u supportsDmaBuf=%d streamHandleType=%u defaultType=0x%x",
+                           importedColorBufferHandle, emu->supportsDmaBuf(),
+                           importedColorBufferInfo.memory.handleInfo
+                               ? importedColorBufferInfo.memory.handleInfo->streamHandleType
+                               : 0u,
+                           static_cast<unsigned>(emu->getDefaultExternalMemoryHandleType()));
+            }
+        }
         if (pCreateInfo == nullptr) {
             VK_ANB_ERR("Failed to prepare ANB image: invalid pCreateInfo.");
             return nullptr;
@@ -196,6 +222,9 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
         // Update create flags and tiling to match the color buffer imported
         createImageCi.flags = importedColorBufferInfo.imageCreateInfoShallow.flags;
         createImageCi.tiling = importedColorBufferInfo.imageCreateInfoShallow.tiling;
+        // Keep a transfer-src capability for the native-image diagnostic copy
+        // in QSRI.  This does not change the external memory binding.
+        createImageCi.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
         const auto& importedColorBufferMemoryInfo = importedColorBufferInfo.memory;
 
@@ -214,6 +243,9 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             0,
             static_cast<VkExternalMemoryHandleTypeFlags>(emu->getDefaultExternalMemoryHandleType()),
         };
+        if (emu->supportsDmaBuf()) {
+            extImageCi.handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
         vk_insert_struct(createImageCi, extImageCi);
 
         VkResult createResult =
@@ -247,6 +279,9 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             VK_NULL_HANDLE,
         };
         VkMemoryDedicatedAllocateInfo* dedicatedInfoPtr = nullptr;
+        // TEMP DIAGNOSTIC: test whether importing the exported allocation as
+        // dedicated to a second VkImage prevents the ANB image from aliasing
+        // the ColorBuffer image on RADV.
         if (importedColorBufferMemoryInfo.dedicatedAllocation) {
             dedicatedInfo.image = out->mImage;
             dedicatedInfoPtr = &dedicatedInfo;
@@ -261,6 +296,13 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
         }
 
         bindOffset = importedColorBufferMemoryInfo.bindOffset;
+        if (anbCreateDiagCount <= 1000) {
+            VK_ANB_ERR("[anb-import-diag] cb=%u guestImage=%p guestMemory=%p reqSize=%llu reqTypeBits=0x%x bindOffset=%llu",
+                       importedColorBufferHandle, out->mImage, out->mImageMemory,
+                       static_cast<unsigned long long>(out->mImageMemoryRequirements.size),
+                       out->mImageMemoryRequirements.memoryTypeBits,
+                       static_cast<unsigned long long>(bindOffset));
+        }
     } else {
         // delete the info struct and pass to vkCreateImage, and also add
         // transfer src capability to allow us to copy to CPU.
@@ -556,21 +598,12 @@ VkResult AndroidNativeBufferInfo::on_vkAcquireImageANDROID(VkEmulation* emu, Vul
     mEverAcquired = true;
 
     if (firstTimeSetup) {
+        // ANB creation releases an externally backed ColorBuffer to
+        // VK_QUEUE_FAMILY_EXTERNAL before the first acquire.  Keep the
+        // normal native-image acquire barrier below for this first use too;
+        // submitting only the semaphore (the old fast path) left the image
+        // without an ownership acquire and produced undefined new-slot data.
         mLastUsedQueueFamilyIndex = defaultQueueFamilyIndex;
-        VkSubmitInfo submitInfo = {
-            VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            0,
-            0,
-            nullptr,
-            nullptr,
-            0,
-            nullptr,
-            (uint32_t)(semaphore == VK_NULL_HANDLE ? 0 : 1),
-            semaphore == VK_NULL_HANDLE ? nullptr : &semaphore,
-        };
-        std::lock_guard<std::mutex> qlock(*defaultQueueMutex);
-        VK_CHECK(vk->vkQueueSubmit(defaultQueue, 1, &submitInfo, fence));
-        return VK_SUCCESS;
     }
 
     if (mLastUsedQueueFamilyIndex == INVALID_QUEUE_FAMILY_INDEX) {
@@ -668,8 +701,8 @@ static constexpr uint64_t kTimeoutNs = 3ULL * 1000000000ULL;
 
 VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
     VkEmulation* emu, VulkanDispatch* vk, uint32_t queueFamilyIndex, VkQueue queue,
-    std::mutex* queueMutex, uint32_t waitSemaphoreCount, const VkSemaphore* pWaitSemaphores,
-    int* pNativeFenceFd) {
+    std::mutex* queueMutex, VkImageLayout imageLayout, uint32_t waitSemaphoreCount,
+    const VkSemaphore* pWaitSemaphores, int* pNativeFenceFd) {
     const uint64_t traceId = gfxstream::host::GetUniqueTracingId();
     GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DEFAULT_CATEGORY, "vkQSRI syncImageToColorBuffer()",
                           GFXSTREAM_TRACE_FLOW(traceId));
@@ -681,6 +714,10 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
 
     mEverSynced = true;
     mLastUsedQueueFamilyIndex = queueFamilyIndex;
+    VK_ANB_ERR("[qsri-diag] cb=%d native=%d queueFam=%u waits=%u", mColorBufferHandle,
+               mUseVulkanNativeImage, queueFamilyIndex, waitSemaphoreCount);
+    VK_ANB_ERR("[qsri-layout-diag] cb=%d releaseLayout=%s", mColorBufferHandle,
+               string_VkImageLayout(imageLayout));
 
     // Setup queue state for this queue family index.
     if (queueFamilyIndex >= mQueueStates.size()) {
@@ -709,14 +746,24 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
     // If using the Vulkan image directly (rather than copying it back to
     // the CPU), change its layout for that use.
     if (mUseVulkanNativeImage) {
-        VkImageMemoryBarrier queueTransferBarrier = {
+        // Copy the guest-side imported image before releasing ownership.  The
+        // resulting bytes let us distinguish a bad host readback from a
+        // guest-image/import path that already contains the corruption.
+        // Use the decoder's tracked guest layout as the source layout. The
+        // framework can invoke QSRI while the image is still in a render
+        // layout; assuming PRESENT_SRC_KHR makes the transfer undefined.
+        const VkImageLayout nativeImageLayout =
+            imageLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                ? emu->adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                : emu->adjustImageLayout(imageLayout);
+        VkImageMemoryBarrier nativeToTransferSrc = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-            .oldLayout = emu->adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
-            .newLayout = emu->adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+            .oldLayout = nativeImageLayout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .srcQueueFamilyIndex = queueFamilyIndex,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = queueFamilyIndex,
             .image = mImage,
             .subresourceRange =
                 {
@@ -729,7 +776,34 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
         };
         vk->vkCmdPipelineBarrier(queueState.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                 &queueTransferBarrier);
+                                 &nativeToTransferSrc);
+
+        VkBufferImageCopy nativeReadbackRegion = {
+            0,
+            mExtent.width,
+            mExtent.height,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            {0, 0, 0},
+            mExtent,
+        };
+        vk->vkCmdCopyImageToBuffer(queueState.cb, mImage,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   mStagingBuffer, 1, &nativeReadbackRegion);
+
+        VkImageMemoryBarrier transferSrcToExternal = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = emu->adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+            .srcQueueFamilyIndex = queueFamilyIndex,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image = mImage,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        vk->vkCmdPipelineBarrier(queueState.cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &transferSrcToExternal);
 
     } else {
         // Not a GL texture. Read it back and put it back in present layout.
@@ -851,17 +925,31 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
     emu->getGlobalState()->unlockGlobalState();
 
     if (mUseVulkanNativeImage) {
-        VK_ANB_DEBUG_OBJ(this, "using native image, so use sync thread to wait");
-        // Queue wait to sync thread with completion callback
-        // Pass anbInfo by value to get a ref
-        auto waitable = emu->getGlobalState()->scheduleAsyncWork(
-            [waitForQsriFenceTask = std::move(waitForQsriFenceTask), this]() mutable {
-                waitForQsriFenceTask();
-                mQsriTimeline->signalNextPresentAndPoll();
-            },
-            "wait for the guest Qsri VkFence signaled");
-
-        queueState.latestUse = std::move(waitable);
+        // RESOURCE_FLUSH can read the host image immediately after QSRI
+        // returns. Complete the release fence before returning so the
+        // cross-domain scanout cannot observe an in-flight ownership transfer.
+        VK_ANB_DEBUG_OBJ(this, "using native image, wait for QSRI fence before return");
+        waitForQsriFenceTask();
+        VK_ANB_ERR("[qsri-diag] cb=%d fence-complete native", mColorBufferHandle);
+        if (mMappedStagingPtr != nullptr) {
+            const VkMappedMemoryRange nativeReadbackInvalidate = {
+                VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, 0, mStagingBufferMemory, 0, VK_WHOLE_SIZE,
+            };
+            vk->vkInvalidateMappedMemoryRanges(mDevice, 1, &nativeReadbackInvalidate);
+            const size_t center =
+                (static_cast<size_t>(mExtent.height) / 2 * mExtent.width + mExtent.width / 2) * 4;
+            const size_t last =
+                (static_cast<size_t>(mExtent.width) * mExtent.height - 1) * 4;
+            VK_ANB_ERR("[native-image-readback-diag] cb=%d first=%02x %02x %02x %02x "
+                       "center=%02x %02x %02x %02x last=%02x %02x %02x %02x",
+                       mColorBufferHandle, mMappedStagingPtr[0], mMappedStagingPtr[1],
+                       mMappedStagingPtr[2], mMappedStagingPtr[3], mMappedStagingPtr[center],
+                       mMappedStagingPtr[center + 1], mMappedStagingPtr[center + 2],
+                       mMappedStagingPtr[center + 3], mMappedStagingPtr[last],
+                       mMappedStagingPtr[last + 1], mMappedStagingPtr[last + 2],
+                       mMappedStagingPtr[last + 3]);
+        }
+        mQsriTimeline->signalNextPresentAndPoll();
     } else {
         VK_ANB_DEBUG_OBJ(this, "not using native image, so wait right away");
         waitForQsriFenceTask();

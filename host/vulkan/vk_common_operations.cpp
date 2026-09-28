@@ -2699,10 +2699,19 @@ bool VkEmulation::importExternalMemory(VulkanDispatch* vk, VkDevice targetDevice
                     handleInfo->handle, handleInfo->streamHandleType);
                 return false;
             }
+            // ColorBuffer allocations prefer dma-buf exports when the host
+            // driver supports VK_EXT_external_memory_dma_buf.  The import
+            // handle type must match the type used by vkGetMemoryFdKHR;
+            // treating a dma-buf as OPAQUE_FD can create a valid Vulkan
+            // allocation which is not an alias of the exported image memory.
+            const VkExternalMemoryHandleTypeFlagBits importHandleType =
+                handleInfo->streamHandleType == STREAM_HANDLE_TYPE_MEM_DMABUF
+                    ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+                    : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
             importInfoFd = {
                 VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
                 dedicatedAllocInfoPtr,
-                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+                importHandleType,
                 static_cast<int>(dupHandle->handle),
             };
             importInfoPtr = &importInfoFd;
@@ -3090,6 +3099,9 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
         // VkExternalMemoryImageCreateInfo unconditionally, as it may be backed by external memory.
         extImageCi.handleTypes =
             static_cast<VkExternalMemoryHandleTypeFlags>(getDefaultExternalMemoryHandleType());
+        if (mDeviceInfo.supportsDmaBuf) {
+            extImageCi.handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
 
         imageCi->pNext = &extImageCi;
     }
@@ -3461,6 +3473,9 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
     // thorough write up.
     const VkImageLayout originalLayout = colorBufferInfo->currentLayout;
     const uint32_t originalQueueFamily = colorBufferInfo->currentQueueFamilyIndex;
+    // ColorBuffers released by the guest are owned by VK_QUEUE_FAMILY_EXTERNAL.
+    // Acquire them on the readback queue and release them back after copying so
+    // the display path observes the same ownership protocol as the guest.
     const bool needsQueueTransfer =
         originalQueueFamily != VK_QUEUE_FAMILY_IGNORED &&
         originalQueueFamily != mQueueFamilyIndex;
@@ -3651,6 +3666,15 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
             bufferCopySize = outPixelsSize;
         }
         std::memcpy(outPixels, mStaging.mMappedPtr, bufferCopySize);
+    }
+
+    static int diagReadCount = 0;
+    if (colorBufferHandle >= 16 && diagReadCount++ < 1000 && outPixels && outPixelsSize >= 4) {
+        const auto* bytes = static_cast<const uint8_t*>(outPixels);
+        GFXSTREAM_ERROR("[vk-readback-diag] cb=%u layout=%s qfam=%u size=%" PRIu64
+                        " first=%02x %02x %02x %02x",
+                        colorBufferHandle, string_VkImageLayout(originalLayout), originalQueueFamily,
+                        outPixelsSize, bytes[0], bytes[1], bytes[2], bytes[3]);
     }
 
     return true;
@@ -4979,6 +5003,18 @@ void VkEmulation::setColorBufferCurrentLayout(uint32_t colorBufferHandle, VkImag
         GFXSTREAM_ERROR("Invalid ColorBuffer handle %d.", static_cast<int>(colorBufferHandle));
         return;
     }
+    static int releaseGuestDiagCount = 0;
+    if (releaseGuestDiagCount++ < 64) {
+        GFXSTREAM_ERROR("[release-guest-diag] cb=%u image=%p memory=%p layout=%s qfam=%u dedicated=%d",
+                        colorBufferHandle, infoPtr->image, infoPtr->memory.memory,
+                        string_VkImageLayout(infoPtr->currentLayout),
+                        infoPtr->currentQueueFamilyIndex, infoPtr->memory.dedicatedAllocation);
+    }
+    static int diagLayoutCount = 0;
+    if (diagLayoutCount++ < 32) {
+        GFXSTREAM_ERROR("[layout-diag] cb=%u layout=%s qfam=%u", colorBufferHandle,
+                        string_VkImageLayout(layout), infoPtr->currentQueueFamilyIndex);
+    }
     infoPtr->currentLayout = layout;
 }
 
@@ -5071,17 +5107,24 @@ void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
                         static_cast<int>(colorBufferHandle));
         return;
     }
+    infoPtr->readbackReady = false;
 
     const auto kGuestUseDefaultImageLayout = adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     std::optional<VkImageMemoryBarrier> layoutTransitionBarrier;
+    std::optional<VkImageMemoryBarrier> clearToPresentBarrier;
+    const bool clearNewImage =
+        infoPtr->currentLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+        (infoPtr->imageCreateInfoShallow.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (infoPtr->currentLayout != kGuestUseDefaultImageLayout) {
         layoutTransitionBarrier = VkImageMemoryBarrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = clearNewImage ? VK_ACCESS_TRANSFER_WRITE_BIT
+                                           : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .oldLayout = infoPtr->currentLayout,
-            .newLayout = kGuestUseDefaultImageLayout,
+            .newLayout = clearNewImage ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                       : kGuestUseDefaultImageLayout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = infoPtr->image,
@@ -5094,6 +5137,27 @@ void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
                     .layerCount = 1,
                 },
         };
+        if (clearNewImage) {
+            clearToPresentBarrier = VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = kGuestUseDefaultImageLayout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = infoPtr->image,
+                .subresourceRange =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+            };
+        }
         infoPtr->currentLayout = kGuestUseDefaultImageLayout;
     }
 
@@ -5145,6 +5209,18 @@ void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
         vk->vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                  &layoutTransitionBarrier.value());
+    }
+    if (clearNewImage) {
+        const VkClearColorValue clearColor = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange clearRange = {
+            VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+        };
+        vk->vkCmdClearColorImage(commandBuffer, infoPtr->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1,
+                                 &clearRange);
+        vk->vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &clearToPresentBarrier.value());
     }
     if (queueTransferBarrier) {
         vk->vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
@@ -5258,8 +5334,29 @@ void VkEmulation::updateColorBufferLayoutAndQueue(uint32_t colorBufferHandle, Vk
         GFXSTREAM_ERROR("Invalid ColorBuffer handle %d.", static_cast<int>(colorBufferHandle));
         return;
     }
+    static int diagLayoutQueueCount = 0;
+    if (diagLayoutQueueCount++ < 64) {
+        GFXSTREAM_ERROR("[layout-queue-diag] cb=%u layout=%s qfam=%u", colorBufferHandle,
+                        string_VkImageLayout(layout), queueFamilyIndex);
+    }
     colorBufferInfo->currentLayout = layout;
     colorBufferInfo->currentQueueFamilyIndex = queueFamilyIndex;
+}
+
+void VkEmulation::setColorBufferReadbackReady(uint32_t colorBufferHandle, bool ready) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto colorBufferInfo = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+    if (!colorBufferInfo) {
+        GFXSTREAM_ERROR("Invalid ColorBuffer handle %d.", static_cast<int>(colorBufferHandle));
+        return;
+    }
+    colorBufferInfo->readbackReady = ready;
+}
+
+bool VkEmulation::isColorBufferReadyForReadback(uint32_t colorBufferHandle) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto colorBufferInfo = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+    return colorBufferInfo != nullptr && colorBufferInfo->readbackReady;
 }
 
 std::optional<RepresentativeColorBufferMemoryTypeInfo>

@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "vk_decoder_global_state.h"
-#include "maintenance4_dispatch.h"
 #include "renderpass2_dispatch.h"
+#include "maintenance4_dispatch.h"
 #include "dynamic_state_dispatch.h"
+#include "host_query_reset_dispatch.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -2444,13 +2445,15 @@ class VkDecoderGlobalState::Impl {
 
         VulkanDispatch* dispatch = dispatch_VkDevice(boxedDevice);
         init_vulkan_dispatch_from_device(vk, *pDevice, dispatch);
-        initMaintenance4Dispatch(dispatch);
         initRenderPass2Dispatch(dispatch);
+        initMaintenance4Dispatch(dispatch);
         const auto extensionEnabled = [&](const char* name) {
             return std::find(deviceInfo.enabledExtensionNames.begin(),
                              deviceInfo.enabledExtensionNames.end(), name) !=
                    deviceInfo.enabledExtensionNames.end();
         };
+        initHostQueryResetDispatch(dispatch, *pDevice, vk->vkGetDeviceProcAddr,
+                                  extensionEnabled(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME));
         initDynamicStateDispatch(
             dispatch, extensionEnabled(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME),
             extensionEnabled(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME));
@@ -7173,6 +7176,15 @@ class VkDecoderGlobalState::Impl {
             return result;
         }
 
+        // The native-image acquire command transfers the ColorBuffer from
+        // EXTERNAL to the guest queue in PRESENT_SRC_KHR.  Keep the decoder's
+        // logical layout in sync with that command; otherwise a later QSRI
+        // can see a stale COLOR_ATTACHMENT_OPTIMAL value even though the
+        // image is physically back in PRESENT_SRC_KHR.
+        if (anbInfo->isUsingNativeImage()) {
+            imageInfo->layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        }
+
         DeviceOpWaitable aniCompletedWaitable = builder.OnQueueSubmittedWithFence(usedFence);
 
         if (semaphore != VK_NULL_HANDLE) {
@@ -7227,18 +7239,15 @@ class VkDecoderGlobalState::Impl {
         if (!imageInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
         auto* anbInfo = imageInfo->anbInfo.get();
-        if (anbInfo->isUsingNativeImage()) {
-            // vkQueueSignalReleaseImageANDROID() is only called by the Android framework's
-            // implementation of vkQueuePresentKHR(). The guest application is responsible for
-            // transitioning the image layout of the image passed to vkQueuePresentKHR() to
-            // the default guest image layout before the call. If the host is using native
-            // Vulkan images where `image` is backed with the same memory as its ColorBuffer,
-            // then we need to update the tracked layout for that ColorBuffer.
-            m_vkEmulation->setColorBufferCurrentLayout(
-                anbInfo->getColorBufferHandle(),
-                m_vkEmulation->adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR));
+        if (!anbInfo) return VK_ERROR_INITIALIZATION_FAILED;
+        const VkImageLayout releaseLayout = imageInfo->layout;
+        static int qsriLayoutDiagCount = 0;
+        if (qsriLayoutDiagCount++ < 96) {
+            GFXSTREAM_ERROR("[qsri-layout-diag] image=%p cb=%u trackedLayout=%s anb=%d",
+                            image, anbInfo ? anbInfo->getColorBufferHandle() : 0,
+                            string_VkImageLayout(imageInfo->layout),
+                            anbInfo && anbInfo->isUsingNativeImage());
         }
-
         if (snapshotsEnabled()) {
             for (uint32_t j = 0; j < waitSemaphoreCount; j++) {
                 auto unboxed_semaphore = pWaitSemaphores[j];
@@ -7255,9 +7264,21 @@ class VkDecoderGlobalState::Impl {
                 semaphoreInfo.onQueueSubmissionWait();
             }
         }
-        return anbInfo->on_vkQueueSignalReleaseImageANDROID(
+        VkResult result = anbInfo->on_vkQueueSignalReleaseImageANDROID(
             m_vkEmulation, vk, queueInfo->queueFamilyIndex, queue, queueInfo->queueMutex.get(),
-            waitSemaphoreCount, pWaitSemaphores, pNativeFenceFd);
+            releaseLayout, waitSemaphoreCount, pWaitSemaphores, pNativeFenceFd);
+        if (result == VK_SUCCESS && anbInfo->isUsingNativeImage()) {
+            // The native-image QSRI submission is complete before the helper
+            // returns. Publish EXTERNAL ownership only after that release has
+            // finished so a concurrent flush cannot observe it in flight.
+            m_vkEmulation->updateColorBufferLayoutAndQueue(
+                anbInfo->getColorBufferHandle(),
+                m_vkEmulation->adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                VK_QUEUE_FAMILY_EXTERNAL);
+            m_vkEmulation->setColorBufferReadbackReady(anbInfo->getColorBufferHandle(), true);
+            imageInfo->layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        }
+        return result;
     }
 
     void on_vkTraceAsyncGOOGLE(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, uint64_t id) {
@@ -7859,9 +7880,23 @@ class VkDecoderGlobalState::Impl {
 
                         acquiredColorBuffers.merge(cmdBufferInfo->acquiredColorBuffers);
                         releasedColorBuffers.merge(cmdBufferInfo->releasedColorBuffers);
-                        for (const auto& ite : cmdBufferInfo->cbLayouts) {
-                            m_vkEmulation->setColorBufferCurrentLayout(ite.first, ite.second);
-                        }
+                    }
+                }
+            }
+
+            // GuestVulkanOnly skips host composition bookkeeping, but the
+            // ColorBuffer layout is still needed by the virtio scanout
+            // readback path. Keep the tracker in sync for every submission.
+            for (uint32_t i = 0; i < submitCount; i++) {
+                for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
+                    VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
+                    CommandBufferInfo* cmdBufferInfo =
+                        gfxstream::base::find(mCommandBufferInfo, cmdBuffer);
+                    if (!cmdBufferInfo) {
+                        continue;
+                    }
+                    for (const auto& ite : cmdBufferInfo->cbLayouts) {
+                        m_vkEmulation->setColorBufferCurrentLayout(ite.first, ite.second);
                     }
                 }
             }

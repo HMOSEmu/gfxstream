@@ -339,6 +339,10 @@ class VkEmulation {
 
         VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         uint32_t currentQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        // Guest rendering must complete QSRI before virtio scanout reads this
+        // ColorBuffer. This state is separate from queue ownership because
+        // releaseColorBufferForGuestUse() publishes EXTERNAL ownership first.
+        bool readbackReady = true;
 
         bool glExported = false;
         bool externalMemoryCompatible = false;
@@ -397,7 +401,6 @@ class VkEmulation {
     int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size = 0);
 
     bool colorBufferNeedsUpdateBetweenGlAndVk(uint32_t colorBufferHandle);
-
     bool readColorBufferToBytes(uint32_t colorBufferHandle, std::vector<uint8_t>* bytes);
     bool readColorBufferToBytes(uint32_t colorBufferHandle, uint32_t x, uint32_t y, uint32_t w,
                                 uint32_t h, void* outPixels, uint64_t outPixelsSize);
@@ -457,6 +460,8 @@ class VkEmulation {
         uint32_t colorBufferHandle);
     void updateColorBufferLayoutAndQueue(uint32_t colorBufferHandle, VkImageLayout layout,
                                          uint32_t queueFamilyIndex);
+    void setColorBufferReadbackReady(uint32_t colorBufferHandle, bool ready);
+    bool isColorBufferReadyForReadback(uint32_t colorBufferHandle);
 
     void applyApiVersionLimits(uint32_t& apiVersion) const {
         if (apiVersion > mGuestVulkanMaxApiVersion) {

@@ -592,6 +592,7 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     bool flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes,
                                      size_t bytesSize);
     bool invalidateColorBufferForVk(HandleType colorBufferHandle);
+    bool isColorBufferReadyForReadback(HandleType colorBufferHandle);
 
     std::optional<BlobDescriptorInfo> exportColorBuffer(HandleType colorBufferHandle);
     std::optional<BlobDescriptorInfo> exportBuffer(HandleType bufferHandle);
@@ -3831,6 +3832,10 @@ bool FrameBuffer::Impl::flushColorBufferFromVk(HandleType colorBufferHandle) {
     return colorBuffer->flushFromVk();
 }
 
+bool FrameBuffer::Impl::isColorBufferReadyForReadback(HandleType colorBufferHandle) {
+    return m_emulationVk && m_emulationVk->isColorBufferReadyForReadback(colorBufferHandle);
+}
+
 bool FrameBuffer::Impl::flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes,
                                                     size_t bytesSize) {
     AutoLock mutex(m_lock);
@@ -4834,6 +4839,10 @@ bool FrameBuffer::flushColorBufferFromVkBytes(HandleType colorBufferHandle, cons
 
 bool FrameBuffer::invalidateColorBufferForVk(HandleType colorBufferHandle) {
     return mImpl->invalidateColorBufferForVk(colorBufferHandle);
+}
+
+bool FrameBuffer::isColorBufferReadyForReadback(HandleType colorBufferHandle) {
+    return mImpl->isColorBufferReadyForReadback(colorBufferHandle);
 }
 
 std::optional<BlobDescriptorInfo> FrameBuffer::exportColorBuffer(HandleType colorBufferHandle) {
